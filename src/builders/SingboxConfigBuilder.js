@@ -4,9 +4,10 @@ import { BaseConfigBuilder } from './BaseConfigBuilder.js';
 import { deepCopy, groupProxiesByCountry } from '../utils.js';
 import { addProxyWithDedup } from './helpers/proxyHelpers.js';
 import { buildSelectorMembers as buildSelectorMemberList, buildNodeSelectMembers, uniqueNames } from './helpers/groupBuilder.js';
+import { normalizeGroupName } from './helpers/groupNameUtils.js';
 
 export class SingboxConfigBuilder extends BaseConfigBuilder {
-    constructor(inputString, selectedRules, customRules, baseConfig, lang, userAgent, groupByCountry = false, enableClashUI = false, externalController, externalUiDownloadUrl) {
+    constructor(inputString, selectedRules, customRules, baseConfig, lang, userAgent, groupByCountry = false, enableClashUI = false, externalController, externalUiDownloadUrl, singboxVersion = '1.12') {
         const resolvedBaseConfig = baseConfig ?? SING_BOX_CONFIG;
         super(inputString, resolvedBaseConfig, lang, userAgent, groupByCountry);
 
@@ -17,10 +18,67 @@ export class SingboxConfigBuilder extends BaseConfigBuilder {
         this.enableClashUI = enableClashUI;
         this.externalController = externalController;
         this.externalUiDownloadUrl = externalUiDownloadUrl;
+        this.singboxVersion = singboxVersion;  // '1.11' or '1.12'
 
         if (this.config?.dns?.servers?.length > 0) {
             this.config.dns.servers[0].detour = this.t('outboundNames.Node Select');
         }
+    }
+
+    /**
+     * Check if subscription format is compatible for use as Sing-Box outbound_provider
+     * Only available in Sing-Box 1.12+
+     * @param {'clash'|'singbox'|'unknown'} format - Detected subscription format
+     * @returns {boolean} - True if format is Sing-Box JSON and version supports providers
+     */
+    isCompatibleProviderFormat(format) {
+        // outbound_providers only supported in Sing-Box 1.12+
+        if (this.singboxVersion === '1.11') {
+            return false;
+        }
+        return format === 'singbox';
+    }
+
+    /**
+     * Generate outbound_providers configuration from collected URLs
+     * @returns {object[]} - Array of outbound provider objects
+     */
+    generateOutboundProviders() {
+        return this.providerUrls.map((url, index) => ({
+            tag: `_auto_provider_${index + 1}`,
+            type: 'http',
+            download_url: url,
+            path: `./providers/_auto_provider_${index + 1}.json`,
+            download_interval: '24h',
+            health_check: {
+                enabled: true,
+                url: 'https://www.gstatic.com/generate_204',
+                interval: '5m'
+            }
+        }));
+    }
+
+    /**
+     * Get list of provider tags
+     * @returns {string[]} - Array of provider tags
+     */
+    getProviderTags() {
+        return this.providerUrls.map((_, index) => `_auto_provider_${index + 1}`);
+    }
+
+    /**
+     * Get all provider tags (user-defined + auto-generated)
+     * @returns {string[]} - Array of provider tags
+     */
+    getAllProviderTags() {
+        if (this.singboxVersion === '1.11') {
+            return [];
+        }
+        const existingTags = Array.isArray(this.config.outbound_providers)
+            ? this.config.outbound_providers.map(p => p?.tag).filter(Boolean)
+            : [];
+        const autoTags = this.getProviderTags();
+        return [...new Set([...existingTags, ...autoTags])];
     }
 
     getProxies() {
@@ -76,20 +134,28 @@ export class SingboxConfigBuilder extends BaseConfigBuilder {
     }
 
     hasOutboundTag(tag) {
-        const normalize = (s) => typeof s === 'string' ? s.trim() : s;
-        const target = normalize(tag);
-        return (this.config.outbounds || []).some(outbound => normalize(outbound?.tag) === target);
+        const target = normalizeGroupName(tag);
+        return (this.config.outbounds || []).some(outbound => normalizeGroupName(outbound?.tag) === target);
     }
 
     addAutoSelectGroup(proxyList) {
         this.config.outbounds = this.config.outbounds || [];
         const tag = this.t('outboundNames.Auto Select');
         if (this.hasOutboundTag(tag)) return;
-        this.config.outbounds.unshift({
+
+        const group = {
             type: "urltest",
             tag,
-            outbounds: deepCopy(uniqueNames(proxyList)),
-        });
+            outbounds: deepCopy(uniqueNames(proxyList))
+        };
+
+        // Add 'providers' field if we have outbound_providers
+        const providerTags = this.getAllProviderTags();
+        if (providerTags.length > 0) {
+            group.providers = providerTags;
+        }
+
+        this.config.outbounds.unshift(group);
     }
 
     addNodeSelectGroup(proxyList) {
@@ -103,11 +169,20 @@ export class SingboxConfigBuilder extends BaseConfigBuilder {
             manualGroupName: this.manualGroupName,
             countryGroupNames: this.countryGroupNames
         });
-        this.config.outbounds.unshift({
+
+        const group = {
             type: "selector",
             tag,
             outbounds: members
-        });
+        };
+
+        // Add 'providers' field if we have outbound_providers
+        const providerTags = this.getAllProviderTags();
+        if (providerTags.length > 0) {
+            group.providers = providerTags;
+        }
+
+        this.config.outbounds.unshift(group);
     }
 
     buildSelectorMembers(proxyList = []) {
@@ -167,13 +242,12 @@ export class SingboxConfigBuilder extends BaseConfigBuilder {
             getName: proxy => this.getProxyName(proxy)
         });
 
-        const normalize = (s) => typeof s === 'string' ? s.trim() : s;
-        const existingTags = new Set((this.config.outbounds || []).map(o => normalize(o?.tag)).filter(Boolean));
+        const existingTags = new Set((this.config.outbounds || []).map(o => normalizeGroupName(o?.tag)).filter(Boolean));
 
         const manualProxyNames = proxies.map(p => p?.tag).filter(Boolean);
         const manualGroupName = manualProxyNames.length > 0 ? this.t('outboundNames.Manual Switch') : null;
         if (manualGroupName) {
-            const manualNorm = normalize(manualGroupName);
+            const manualNorm = normalizeGroupName(manualGroupName);
             if (!existingTags.has(manualNorm)) {
                 this.config.outbounds.push({
                     type: 'selector',
@@ -193,7 +267,7 @@ export class SingboxConfigBuilder extends BaseConfigBuilder {
                 return;
             }
             const groupName = `${emoji} ${name}`;
-            const norm = normalize(groupName);
+            const norm = normalizeGroupName(groupName);
             if (!existingTags.has(norm)) {
                 this.config.outbounds.push({
                     tag: groupName,
@@ -206,7 +280,7 @@ export class SingboxConfigBuilder extends BaseConfigBuilder {
         });
 
         const nodeSelectTag = this.t('outboundNames.Node Select');
-        const nodeSelectGroup = this.config.outbounds.find(o => normalize(o?.tag) === normalize(nodeSelectTag));
+        const nodeSelectGroup = this.config.outbounds.find(o => normalizeGroupName(o?.tag) === normalizeGroupName(nodeSelectTag));
         if (nodeSelectGroup && Array.isArray(nodeSelectGroup.outbounds)) {
             const rebuilt = buildNodeSelectMembers({
                 proxyList: [],
@@ -222,11 +296,130 @@ export class SingboxConfigBuilder extends BaseConfigBuilder {
         this.manualGroupName = manualGroupName;
     }
 
+    /**
+     * Merge user-defined proxy groups (selector/urltest outbounds) with system-generated ones
+     * Handles same-tag groups by merging outbounds/providers fields
+     * @param {Array} userGroups - User-defined proxy groups from input config (converted to Clash format)
+     */
+    mergeUserProxyGroups(userGroups) {
+        if (!Array.isArray(userGroups)) return;
+
+        const proxyList = this.getProxyList();
+        const validProxyTags = new Set(proxyList);
+        const allProviderTags = new Set(this.getAllProviderTags());
+
+        // Build valid reference set (proxy tags, group tags, special names)
+        const groupTags = new Set(
+            (this.config.outbounds || [])
+                .filter(o => o.type === 'selector' || o.type === 'urltest')
+                .map(o => normalizeGroupName(o?.tag))
+                .filter(Boolean)
+        );
+        const validRefs = new Set(['DIRECT', 'REJECT', 'direct', 'block']);
+        proxyList.forEach(n => validRefs.add(n));
+        groupTags.forEach(n => validRefs.add(n));
+
+        userGroups.forEach(userGroup => {
+            if (!userGroup?.name) return;
+
+            // Find existing outbound by normalized tag/name
+            const existingIndex = (this.config.outbounds || []).findIndex(o =>
+                normalizeGroupName(o?.tag) === normalizeGroupName(userGroup.name)
+            );
+
+            if (existingIndex >= 0) {
+                // Merge with existing system group
+                const existing = this.config.outbounds[existingIndex];
+
+                // Merge 'providers' field (Sing-Box uses 'providers' not 'use')
+                if (Array.isArray(userGroup.use) && userGroup.use.length > 0) {
+                    const validUserProviders = userGroup.use.filter(p => allProviderTags.has(p));
+                    existing.providers = [...new Set([
+                        ...(existing.providers || []),
+                        ...validUserProviders
+                    ])];
+                }
+
+                // Merge 'outbounds' field (equivalent to Clash 'proxies')
+                if (Array.isArray(userGroup.proxies) && userGroup.proxies.length > 0) {
+                    const validUserOutbounds = userGroup.proxies.filter(p => validRefs.has(p));
+                    existing.outbounds = [...new Set([
+                        ...(existing.outbounds || []),
+                        ...validUserOutbounds
+                    ])];
+                }
+
+                // Preserve user's custom settings
+                if (userGroup.url) existing.url = userGroup.url;
+                if (typeof userGroup.interval === 'number') {
+                    existing.interval = `${userGroup.interval}s`;
+                }
+            } else {
+                // New user-defined group - convert from Clash format and add
+                const newOutbound = {
+                    type: userGroup.type === 'url-test' ? 'urltest' : 'selector',
+                    tag: userGroup.name
+                };
+
+                // Validate outbounds references
+                if (Array.isArray(userGroup.proxies)) {
+                    newOutbound.outbounds = userGroup.proxies.filter(p => validRefs.has(p));
+                }
+
+                // Validate providers references
+                if (Array.isArray(userGroup.use)) {
+                    const validProviders = userGroup.use.filter(p => allProviderTags.has(p));
+                    if (validProviders.length > 0) {
+                        newOutbound.providers = validProviders;
+                    }
+                }
+
+                // Only add if has valid outbounds or providers
+                if ((newOutbound.outbounds?.length > 0) || (newOutbound.providers?.length > 0)) {
+                    this.config.outbounds.push(newOutbound);
+                }
+            }
+        });
+    }
+
+    /**
+     * Validate outbounds before final output
+     * Ensures urltest groups have outbounds, fills empty ones with all proxy tags
+     */
+    validateOutbounds() {
+        const proxyList = this.getProxyList();
+        const providerTags = this.getAllProviderTags();
+
+        (this.config.outbounds || []).forEach(outbound => {
+            // For urltest groups, ensure they have outbounds or providers
+            if (outbound.type === 'urltest' &&
+                (!outbound.outbounds || outbound.outbounds.length === 0) &&
+                (!outbound.providers || outbound.providers.length === 0)) {
+                // Fill with all available proxy tags
+                outbound.outbounds = [...proxyList];
+                // Also use all providers if available
+                if (providerTags.length > 0) {
+                    outbound.providers = [...providerTags];
+                }
+            }
+        });
+    }
+
     formatConfig() {
         const rules = generateRules(this.selectedRules, this.customRules);
         const { site_rule_sets, ip_rule_sets } = generateRuleSets(this.selectedRules, this.customRules);
 
         this.config.route.rule_set = [...site_rule_sets, ...ip_rule_sets];
+
+        // Add outbound_providers if we have any
+        if (this.providerUrls.length > 0) {
+            const existingProviders = Array.isArray(this.config.outbound_providers) ? this.config.outbound_providers : [];
+            const newProviders = this.generateOutboundProviders();
+            this.config.outbound_providers = [...existingProviders, ...newProviders];
+        }
+
+        // Validate outbounds: fill empty urltest groups with all proxies
+        this.validateOutbounds();
 
         rules.filter(rule => !!rule.domain_suffix || !!rule.domain_keyword).map(rule => {
             this.config.route.rules.push({
