@@ -1,13 +1,13 @@
 import { BaseConfigBuilder } from './BaseConfigBuilder.js';
 import { groupProxiesByCountry } from '../utils.js';
-import { SURGE_CONFIG, SURGE_SITE_RULE_SET_BASEURL, SURGE_IP_RULE_SET_BASEURL, generateRules, getOutbounds, PREDEFINED_RULE_SETS } from '../config/index.js';
+import { SURGE_CONFIG, SURGE_SITE_RULE_SET_BASEURL, SURGE_IP_RULE_SET_BASEURL, generateRules, getOutbounds, PREDEFINED_RULE_SETS, DIRECT_DEFAULT_RULES } from '../config/index.js';
 import { addProxyWithDedup } from './helpers/proxyHelpers.js';
 import { buildSelectorMembers, buildNodeSelectMembers, uniqueNames } from './helpers/groupBuilder.js';
 
 export class SurgeConfigBuilder extends BaseConfigBuilder {
-    constructor(inputString, selectedRules, customRules, baseConfig, lang, userAgent, groupByCountry) {
+    constructor(inputString, selectedRules, customRules, baseConfig, lang, userAgent, groupByCountry, includeAutoSelect = true) {
         const resolvedBaseConfig = baseConfig ?? SURGE_CONFIG;
-        super(inputString, resolvedBaseConfig, lang, userAgent, groupByCountry);
+        super(inputString, resolvedBaseConfig, lang, userAgent, groupByCountry, includeAutoSelect);
         this.selectedRules = selectedRules;
         this.customRules = customRules;
         this.subscriptionUrl = null;
@@ -235,7 +235,8 @@ export class SurgeConfigBuilder extends BaseConfigBuilder {
             translator: this.t,
             groupByCountry: false,
             manualGroupName: this.manualGroupName,
-            countryGroupNames: this.countryGroupNames
+            countryGroupNames: this.countryGroupNames,
+            includeAutoSelect: this.includeAutoSelect
         });
     }
 
@@ -245,11 +246,13 @@ export class SurgeConfigBuilder extends BaseConfigBuilder {
             translator: this.t,
             groupByCountry: this.groupByCountry,
             manualGroupName: this.manualGroupName,
-            countryGroupNames: this.countryGroupNames
+            countryGroupNames: this.countryGroupNames,
+            includeAutoSelect: this.includeAutoSelect
         });
     }
 
     addAutoSelectGroup(proxyList) {
+        if (!this.includeAutoSelect) return;
         this.config['proxy-groups'] = this.config['proxy-groups'] || [];
         const name = this.t('outboundNames.Auto Select');
         if (this.hasProxyGroup(name)) return;
@@ -274,10 +277,14 @@ export class SurgeConfigBuilder extends BaseConfigBuilder {
     addOutboundGroups(outbounds, proxyList) {
         outbounds.forEach(outbound => {
             if (outbound !== this.t('outboundNames.Node Select')) {
-                const options = this.buildAggregatedOptions(proxyList);
+                let options = this.buildAggregatedOptions(proxyList);
                 const name = this.t(`outboundNames.${outbound}`);
                 if (this.hasProxyGroup(name)) {
                     return;
+                }
+                // For rules that should default to DIRECT, move DIRECT to the front
+                if (DIRECT_DEFAULT_RULES.has(outbound)) {
+                    options = ['DIRECT', ...options.filter(p => p !== 'DIRECT')];
                 }
                 this.config['proxy-groups'].push(
                     this.createProxyGroup(name, 'select', options)
@@ -350,7 +357,8 @@ export class SurgeConfigBuilder extends BaseConfigBuilder {
                 translator: this.t,
                 groupByCountry: true,
                 manualGroupName,
-                countryGroupNames
+                countryGroupNames,
+                includeAutoSelect: this.includeAutoSelect
             });
             const newGroup = this.createProxyGroup(this.t('outboundNames.Node Select'), 'select', newOptions);
             this.config['proxy-groups'][nodeSelectGroupIndex] = newGroup;
